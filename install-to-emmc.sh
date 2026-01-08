@@ -174,6 +174,18 @@ echo ""
 echo "=== Step 5: Generating NixOS configuration ==="
 nixos-generate-config --root "$MOUNT_POINT"
 
+# Fix hardware-configuration.nix to use /dev/mapper/cryptroot instead of inner UUID
+# (systemd initrd needs this to properly wait for LUKS before mounting root)
+echo "Fixing hardware-configuration.nix for LUKS..."
+# Get the inner ext4 UUID that nixos-generate-config detected
+INNER_UUID=$(grep -A2 'fileSystems."/" =' "$MOUNT_POINT/etc/nixos/hardware-configuration.nix" | grep 'device = ' | sed 's|.*by-uuid/\([^"]*\)".*|\1|')
+if [ -n "$INNER_UUID" ]; then
+    sed -i "s|/dev/disk/by-uuid/$INNER_UUID|/dev/mapper/cryptroot|" "$MOUNT_POINT/etc/nixos/hardware-configuration.nix"
+    echo "  Replaced UUID $INNER_UUID with /dev/mapper/cryptroot"
+else
+    echo "  WARNING: Could not find root filesystem UUID to replace"
+fi
+
 echo ""
 echo "=== Step 6: Generating initrd SSH host keys ==="
 mkdir -p "$MOUNT_POINT/etc/secrets/initrd"
@@ -319,6 +331,12 @@ echo ""
 echo "=== Step 8: Installing NixOS ==="
 echo "This may take several minutes..."
 nixos-install --root "$MOUNT_POINT" --no-root-passwd
+
+# Fix initrd secrets path for post-install rebuilds
+# During install: /mnt/etc/secrets/... (file is at mount point)
+# After install: /etc/secrets/... (file is at root)
+echo "Fixing initrd secrets path for future rebuilds..."
+sed -i "s|/mnt/etc/secrets|/etc/secrets|g" "$MOUNT_POINT/etc/nixos/configuration.nix"
 
 echo ""
 echo "=== Step 9: Cleanup ==="
