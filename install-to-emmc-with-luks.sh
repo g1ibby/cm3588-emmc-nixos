@@ -272,6 +272,18 @@ cat > "$MOUNT_POINT/etc/nixos/configuration.nix" << 'NIXCONFIG'
     };
   };
 
+  # Static MAC address for network interface
+  # RTL8125B doesn't have MAC in EEPROM, kernel generates random one each boot
+  # Using systemd.network.links (most idiomatic NixOS approach - sets MAC at link layer)
+  boot.initrd.systemd.network.links."10-eth" = {
+    matchConfig.Driver = "r8169";
+    linkConfig.MACAddress = "MAC_ADDRESS_PLACEHOLDER";
+  };
+  systemd.network.links."10-eth" = {
+    matchConfig.Driver = "r8169";
+    linkConfig.MACAddress = "MAC_ADDRESS_PLACEHOLDER";
+  };
+
   # Network
   networking.hostName = "HOSTNAME_PLACEHOLDER";
   networking.networkmanager.enable = true;

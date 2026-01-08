@@ -30,6 +30,17 @@ if [[ ! -f "$INSTALL_SCRIPT_LUKS" ]]; then
 fi
 echo "Install scripts: $INSTALL_SCRIPT, $INSTALL_SCRIPT_LUKS"
 
+# Generate a random locally-administered MAC address
+# First byte: 02 (unicast, locally administered)
+# Remaining bytes: random
+generate_mac() {
+    printf '02:%02x:%02x:%02x:%02x:%02x\n' \
+        $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256)) \
+        $((RANDOM % 256)) $((RANDOM % 256))
+}
+GENERATED_MAC=$(generate_mac)
+echo "Generated MAC address: $GENERATED_MAC"
+
 # Show USB device info
 echo ""
 echo "Target USB device: $USB_DEVICE"
@@ -115,9 +126,12 @@ echo "SSH key added for root user"
 sudo mkdir -p "$MOUNT_POINT/root"
 sudo cp "$INSTALL_SCRIPT" "$MOUNT_POINT/root/install-to-emmc.sh"
 sudo cp "$INSTALL_SCRIPT_LUKS" "$MOUNT_POINT/root/install-to-emmc-with-luks.sh"
+# Replace MAC placeholder with generated MAC in LUKS script
+sudo sed -i "s/MAC_ADDRESS_PLACEHOLDER/$GENERATED_MAC/g" "$MOUNT_POINT/root/install-to-emmc-with-luks.sh"
 sudo chmod +x "$MOUNT_POINT/root/install-to-emmc.sh"
 sudo chmod +x "$MOUNT_POINT/root/install-to-emmc-with-luks.sh"
 echo "Install scripts copied to /root/"
+echo "  MAC address embedded: $GENERATED_MAC"
 
 sudo umount "$MOUNT_POINT"
 sync
