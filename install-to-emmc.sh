@@ -5,8 +5,10 @@ set -euo pipefail
 HOSTNAME="cm3588-nas"
 USERNAME="user"
 TIMEZONE="Asia/Bangkok"
+LUKS_NAME="cryptroot"
 
 MOUNT_POINT="/mnt"
+BOOT_MOUNT="/mnt/boot"
 
 echo "=== CM3588 NixOS eMMC Installation Script ==="
 echo ""
@@ -52,6 +54,8 @@ echo "Configuration:"
 echo "  Hostname: $HOSTNAME"
 echo "  Username: $USERNAME"
 echo "  Timezone: $TIMEZONE"
+echo "  LUKS encryption: ENABLED"
+echo "  Remote SSH unlock: port 2222"
 echo ""
 
 # Get SSH key from current system
@@ -88,10 +92,12 @@ parted -s "$EMMC_DEVICE" mklabel gpt
 # Create partitions:
 # Partition 1: idbloader (Rockchip first-stage loader) - 32KiB to 8MiB
 # Partition 2: U-Boot - 8MiB to 16MiB
-# Partition 3: Root filesystem - 16MiB to end
+# Partition 3: /boot (unencrypted) - 16MiB to 528MiB (512MiB)
+# Partition 4: LUKS encrypted root - 528MiB to end
 parted -s "$EMMC_DEVICE" mkpart idbloader 32KiB 8MiB
 parted -s "$EMMC_DEVICE" mkpart uboot 8MiB 16MiB
-parted -s "$EMMC_DEVICE" mkpart nixos 16MiB 100%
+parted -s "$EMMC_DEVICE" mkpart boot 16MiB 528MiB
+parted -s "$EMMC_DEVICE" mkpart nixos 528MiB 100%
 parted -s "$EMMC_DEVICE" set 3 legacy_boot on
 
 echo "Partitions created:"
@@ -125,21 +131,62 @@ else
 fi
 
 echo ""
-echo "=== Step 3: Formatting root partition ==="
-mkfs.ext4 -L nixos "${EMMC_DEVICE}p3"
+echo "=== Step 3: Setting up LUKS encryption ==="
+
+# Format /boot partition (unencrypted)
+echo "Formatting /boot partition..."
+mkfs.ext4 -L boot "${EMMC_DEVICE}p3"
+
+# Setup LUKS encryption on partition 4
+echo ""
+echo "Setting up LUKS encryption on root partition..."
+echo "You will be prompted to enter a passphrase."
+echo "This passphrase will be required to unlock the system at every boot."
+echo ""
+cryptsetup luksFormat --type luks2 \
+    --cipher aes-xts-plain64 \
+    --key-size 512 \
+    --hash sha512 \
+    --pbkdf argon2id \
+    --label cryptroot \
+    "${EMMC_DEVICE}p4"
+
+# Open the LUKS volume
+echo ""
+echo "Opening LUKS volume..."
+cryptsetup luksOpen "${EMMC_DEVICE}p4" "$LUKS_NAME"
+
+# Get the UUID for NixOS configuration
+LUKS_UUID=$(blkid -s UUID -o value "${EMMC_DEVICE}p4")
+echo "LUKS UUID: $LUKS_UUID"
+
+# Format the inner filesystem
+echo "Formatting encrypted root filesystem..."
+mkfs.ext4 -L nixos "/dev/mapper/$LUKS_NAME"
 
 echo ""
-echo "=== Step 4: Mounting eMMC ==="
-mount "${EMMC_DEVICE}p3" "$MOUNT_POINT"
+echo "=== Step 4: Mounting filesystems ==="
+mount "/dev/mapper/$LUKS_NAME" "$MOUNT_POINT"
+mkdir -p "$BOOT_MOUNT"
+mount "${EMMC_DEVICE}p3" "$BOOT_MOUNT"
 
 echo ""
 echo "=== Step 5: Generating NixOS configuration ==="
 nixos-generate-config --root "$MOUNT_POINT"
 
 echo ""
-echo "=== Step 6: Writing custom configuration ==="
+echo "=== Step 6: Generating initrd SSH host keys ==="
+mkdir -p "$MOUNT_POINT/etc/secrets/initrd"
+ssh-keygen -t ed25519 -N "" -f "$MOUNT_POINT/etc/secrets/initrd/ssh_host_ed25519_key"
+chmod 600 "$MOUNT_POINT/etc/secrets/initrd/ssh_host_ed25519_key"
+INITRD_SSH_FINGERPRINT=$(ssh-keygen -lf "$MOUNT_POINT/etc/secrets/initrd/ssh_host_ed25519_key.pub")
+echo "Initrd SSH host key generated."
+echo "Fingerprint: $INITRD_SSH_FINGERPRINT"
+
+echo ""
+echo "=== Step 7: Writing custom configuration ==="
 cat > "$MOUNT_POINT/etc/nixos/configuration.nix" << 'NIXCONFIG'
-{ config, pkgs, ... }:
+{ config, pkgs, lib, ... }:
 
 {
   imports = [
@@ -149,6 +196,69 @@ cat > "$MOUNT_POINT/etc/nixos/configuration.nix" << 'NIXCONFIG'
   # Bootloader - use extlinux (U-Boot compatible)
   boot.loader.grub.enable = false;
   boot.loader.generic-extlinux-compatible.enable = true;
+
+  # Kernel parameters for DHCP in initrd
+  boot.kernelParams = [ "ip=dhcp" ];
+
+  # Initrd configuration for LUKS and remote unlock
+  boot.initrd = {
+    # Use systemd in initrd for proper device dependency handling
+    # (PCIe NIC takes ~25 seconds to initialize, systemd waits for it properly)
+    systemd.enable = true;
+
+    # Kernel modules needed for early boot
+    availableKernelModules = [
+      # Network driver for RTL8125B 2.5GbE (PCIe attached)
+      "r8169"
+      "realtek"
+      # PCIe support (ethernet is PCIe-attached on CM3588)
+      "pcie_rockchip_host"
+      "phy_rockchip_naneng_combphy"
+      # eMMC storage
+      "mmc_block"
+      "sdhci_of_dwcmshc"
+      # Crypto support
+      "dm-crypt"
+      "cryptd"
+      "aes_generic"
+    ];
+
+    kernelModules = [ "dm-crypt" ];
+
+    # Secrets for initrd (lib.mkForce needed to override initrd-ssh.nix automatic
+    # definition with unquoted path required by extlinux bootloader)
+    secrets = lib.mkForce {
+      "/etc/secrets/initrd/ssh_host_ed25519_key" = /mnt/etc/secrets/initrd/ssh_host_ed25519_key;
+    };
+
+    # LUKS device configuration
+    luks.devices."cryptroot" = {
+      device = "/dev/disk/by-uuid/LUKS_UUID_PLACEHOLDER";
+      allowDiscards = true;
+    };
+
+    # Network configuration for remote unlock
+    network = {
+      enable = true;
+
+      # SSH server in initrd for remote unlock
+      ssh = {
+        enable = true;
+        # Use different port to avoid host key conflicts with main SSH
+        port = 2222;
+
+        # Same authorized keys as root user
+        authorizedKeys = [
+          "SSH_KEY_PLACEHOLDER"
+        ];
+
+        # Dedicated host keys for initrd
+        hostKeys = [
+          "/etc/secrets/initrd/ssh_host_ed25519_key"
+        ];
+      };
+    };
+  };
 
   # Network
   networking.hostName = "HOSTNAME_PLACEHOLDER";
@@ -185,6 +295,7 @@ cat > "$MOUNT_POINT/etc/nixos/configuration.nix" << 'NIXCONFIG'
     git
     wget
     curl
+    cryptsetup
   ];
 
   # Timezone
@@ -200,27 +311,44 @@ sed -i "s/HOSTNAME_PLACEHOLDER/$HOSTNAME/g" "$MOUNT_POINT/etc/nixos/configuratio
 sed -i "s/USERNAME_PLACEHOLDER/$USERNAME/g" "$MOUNT_POINT/etc/nixos/configuration.nix"
 sed -i "s|TIMEZONE_PLACEHOLDER|$TIMEZONE|g" "$MOUNT_POINT/etc/nixos/configuration.nix"
 sed -i "s|SSH_KEY_PLACEHOLDER|$SSH_KEY|g" "$MOUNT_POINT/etc/nixos/configuration.nix"
+sed -i "s|LUKS_UUID_PLACEHOLDER|$LUKS_UUID|g" "$MOUNT_POINT/etc/nixos/configuration.nix"
 
 echo "Configuration written to $MOUNT_POINT/etc/nixos/configuration.nix"
 
 echo ""
-echo "=== Step 7: Installing NixOS ==="
+echo "=== Step 8: Installing NixOS ==="
 echo "This may take several minutes..."
 nixos-install --root "$MOUNT_POINT" --no-root-passwd
 
 echo ""
-echo "=== Step 8: Cleanup ==="
+echo "=== Step 9: Cleanup ==="
+umount "$BOOT_MOUNT"
 umount "$MOUNT_POINT"
+cryptsetup luksClose "$LUKS_NAME"
 sync
 
 echo ""
+echo "=============================================="
 echo "=== Installation Complete! ==="
+echo "=============================================="
 echo ""
-echo "Next steps:"
-echo "1. Power off: poweroff"
-echo "2. Remove the USB drive"
-echo "3. Power on - CM3588 will boot from eMMC"
-echo "4. SSH in: ssh $USERNAME@<IP> or ssh root@<IP>"
+echo "IMPORTANT: Save this information for remote unlock!"
+echo ""
+echo "Initrd SSH fingerprint (port 2222):"
+echo "  $INITRD_SSH_FINGERPRINT"
+echo ""
+echo "Remote Unlock Instructions:"
+echo "  1. Power off: poweroff"
+echo "  2. Remove the USB drive"
+echo "  3. Power on CM3588 - wait ~30 seconds for network"
+echo "  4. SSH to initrd for unlock:"
+echo "       ssh -p 2222 root@<CM3588-IP>"
+echo "  5. Enter your LUKS passphrase when prompted"
+echo "  6. After unlock, SSH to the full system:"
+echo "       ssh root@<CM3588-IP>"
+echo "       ssh $USERNAME@<CM3588-IP>"
+echo ""
+echo "If you don't know the IP, check your router's DHCP leases."
 echo ""
 read -p "Power off now? [y/N]: " poweroff_confirm
 if [[ "$poweroff_confirm" == "y" || "$poweroff_confirm" == "Y" ]]; then
