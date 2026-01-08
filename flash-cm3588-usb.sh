@@ -7,6 +7,7 @@ SSH_KEY="$HOME/.ssh/id_ed25519.pub"
 MOUNT_POINT="/mnt/nixos-usb"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_SCRIPT="$SCRIPT_DIR/install-to-emmc.sh"
+INSTALL_SCRIPT_LUKS="$SCRIPT_DIR/install-to-emmc-with-luks.sh"
 
 echo "=== CM3588 NixOS USB Flash Script ==="
 echo ""
@@ -18,12 +19,16 @@ if [[ ! -f "$SSH_KEY" ]]; then
 fi
 echo "SSH key: $SSH_KEY"
 
-# Check install script exists
+# Check install scripts exist
 if [[ ! -f "$INSTALL_SCRIPT" ]]; then
     echo "ERROR: Install script not found at $INSTALL_SCRIPT"
     exit 1
 fi
-echo "Install script: $INSTALL_SCRIPT"
+if [[ ! -f "$INSTALL_SCRIPT_LUKS" ]]; then
+    echo "ERROR: LUKS install script not found at $INSTALL_SCRIPT_LUKS"
+    exit 1
+fi
+echo "Install scripts: $INSTALL_SCRIPT, $INSTALL_SCRIPT_LUKS"
 
 # Show USB device info
 echo ""
@@ -106,11 +111,13 @@ sudo mkdir -p "$MOUNT_POINT/etc/ssh/authorized_keys.d"
 cat "$SSH_KEY" | sudo tee "$MOUNT_POINT/etc/ssh/authorized_keys.d/root" > /dev/null
 echo "SSH key added for root user"
 
-# Copy install script to /root (create dir if needed)
+# Copy install scripts to /root (create dir if needed)
 sudo mkdir -p "$MOUNT_POINT/root"
 sudo cp "$INSTALL_SCRIPT" "$MOUNT_POINT/root/install-to-emmc.sh"
+sudo cp "$INSTALL_SCRIPT_LUKS" "$MOUNT_POINT/root/install-to-emmc-with-luks.sh"
 sudo chmod +x "$MOUNT_POINT/root/install-to-emmc.sh"
-echo "Install script copied to /root/install-to-emmc.sh"
+sudo chmod +x "$MOUNT_POINT/root/install-to-emmc-with-luks.sh"
+echo "Install scripts copied to /root/"
 
 sudo umount "$MOUNT_POINT"
 sync
@@ -122,4 +129,6 @@ echo "USB drive is ready. Next steps:"
 echo "1. Insert USB into CM3588 and power on"
 echo "2. Find CM3588 IP: nmap -sn 192.168.1.0/24"
 echo "3. SSH in: ssh root@<IP>"
-echo "4. Run: bash /root/install-to-emmc.sh"
+echo "4. Run one of:"
+echo "   - bash /root/install-to-emmc.sh              (without encryption)"
+echo "   - bash /root/install-to-emmc-with-luks.sh    (with LUKS encryption + remote unlock)"
